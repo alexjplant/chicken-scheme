@@ -1,0 +1,193 @@
+name: Build Chicken Scheme releases
+
+on:
+  schedule:
+    - cron: '0 6 * * *'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Chicken tag to build (e.g., 6.0.0). Leave empty to discover tags.'
+        required: false
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  discover:
+    runs-on: ubuntu-latest
+    outputs:
+      tags: ${{ steps.discover.outputs.tags }}
+    steps:
+      - name: Checkout workflow repo
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y jq git
+
+      - name: Discover tags
+        id: discover
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -n "${{ inputs.tag }}" ]; then
+            tags="[\"${{ inputs.tag }}\"]"
+          else
+            tags=$(.github/workflows/scripts/discover-tags.sh --json)
+          fi
+          # GitHub Actions requires multi-line outputs to use a heredoc delimiter.
+          {
+            echo 'tags<<EOF'
+            echo "$tags"
+            echo 'EOF'
+          } >> "$GITHUB_OUTPUT"
+          echo "Discovered tags: $tags"
+
+  build:
+    needs: discover
+    if: needs.discover.outputs.tags != '[]'
+    strategy:
+      fail-fast: false
+      matrix:
+        tag: ${{ fromJSON(needs.discover.outputs.tags) }}
+        platform: [linux-x64, linux-arm64, macos-arm64]
+        include:
+          - platform: linux-x64
+            runner: ubuntu-latest
+            os: linux
+            arch: x64
+          - platform: linux-arm64
+            runner: ubuntu-24.04-arm
+            os: linux
+            arch: arm64
+          - platform: macos-arm64
+            runner: macos-14
+            os: macos
+            arch: arm64
+
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - name: Checkout workflow repo
+        uses: actions/checkout@v4
+        with:
+          path: workflow
+
+      - name: Install dependencies
+        shell: bash
+        run: |
+          if [ "${{ matrix.os }}" = "linux" ]; then
+            sudo apt-get update
+            sudo apt-get install -y build-essential git wget
+          else
+            # macOS: ensure Xcode command line tools and wget are available.
+            xcode-select -p >/dev/null || xcode-select --install || true
+            if ! command -v wget >/dev/null 2>&1; then
+              brew install wget
+            fi
+          fi
+
+      - name: Checkout chicken-core
+        run: |
+          set -euo pipefail
+          git clone --branch "${{ matrix.tag }}" \
+            https://code.call-cc.org/git/chicken-core.git chicken-core
+
+      - name: Apply relocatable patch
+        working-directory: chicken-core
+        run: |
+          set -euo pipefail
+          git apply --check "${GITHUB_WORKSPACE}/workflow/.github/workflows/patches/chicken-relocatable.patch"
+          git apply "${GITHUB_WORKSPACE}/workflow/.github/workflows/patches/chicken-relocatable.patch"
+
+      - name: Build Chicken
+        working-directory: chicken-core
+        run: |
+          set -euo pipefail
+          # Chicken 6 bootstraps via scripts/bootstrap.sh, which downloads a
+          # snapshot, builds a temporary chicken, and produces chicken-boot.
+          sh ./scripts/bootstrap.sh
+          # Reconfigure to build the real toolchain with chicken-boot.
+          ./configure --chicken ./chicken-boot --prefix /opt/chicken
+          make
+
+      - name: Package Chicken
+        working-directory: chicken-core
+        run: |
+          set -euo pipefail
+          "${GITHUB_WORKSPACE}/workflow/.github/workflows/scripts/package.sh" \
+            --version "${{ matrix.tag }}" \
+            --os "${{ matrix.os }}" \
+            --arch "${{ matrix.arch }}"
+
+      - name: Smoke test
+        working-directory: chicken-core
+        run: |
+          set -euo pipefail
+          tmp=$(mktemp -d)
+          tar -xzf "dist/chicken-${{ matrix.tag }}-${{ matrix.platform }}.tar.gz" -C "$tmp"
+          "$tmp/bin/csi" -version
+          "$tmp/bin/csc" -version
+          rm -rf "$tmp"
+
+      - name: Upload tarball artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: chicken-${{ matrix.tag }}-${{ matrix.platform }}
+          path: chicken-core/dist/chicken-${{ matrix.tag }}-${{ matrix.platform }}.tar.gz
+          if-no-files-found: error
+
+  release:
+    needs: [discover, build]
+    if: needs.discover.outputs.tags != '[]' && needs.build.result == 'success'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout workflow repo
+        uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          pattern: chicken-*
+          merge-multiple: true
+
+      - name: Create releases and upload assets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          tags='${{ needs.discover.outputs.tags }}'
+          for tag in $(echo "$tags" | jq -r '.[]'); do
+            assets=("dist/chicken-${tag}-linux-x64.tar.gz"
+                    "dist/chicken-${tag}-linux-arm64.tar.gz"
+                    "dist/chicken-${tag}-macos-arm64.tar.gz")
+
+            # Verify all assets exist on disk.
+            for asset in "${assets[@]}"; do
+              if [ ! -f "$asset" ]; then
+                echo "Missing asset: $asset" >&2
+                exit 1
+              fi
+            done
+
+            if ! gh release view "$tag" >/dev/null 2>&1; then
+              echo "Creating release $tag."
+              gh release create "$tag" \
+                --title "$tag" \
+                --notes "Chicken Scheme ${tag} prebuilt binaries." \
+                "${assets[@]}"
+            else
+              echo "Release $tag exists; checking for missing assets."
+              existing=$(gh release view "$tag" --json assets --jq '.assets[].name')
+              for asset in "${assets[@]}"; do
+                name=$(basename "$asset")
+                if ! grep -qx "$name" <<< "$existing"; then
+                  echo "Uploading $name"
+                  gh release upload "$tag" "$asset"
+                fi
+              done
+            fi
+          done

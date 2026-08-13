@@ -1,0 +1,49 @@
+diff --git a/egg-environment.scm b/egg-environment.scm
+index ee68df7c..016e9f3f 100644
+--- a/egg-environment.scm
++++ b/egg-environment.scm
+@@ -65,8 +65,16 @@ EOF
+       (foreign-value "C_WINDOWS_SHELL" bool)
+       'unix))
+ 
++(define (relocatable-path sub default)
++  "Return SUB relative to CHICKEN_PREFIX when set, otherwise DEFAULT."
++  (cond ((get-environment-variable "CHICKEN_PREFIX") =>
++         (lambda (prefix) (make-pathname prefix sub)))
++        (else default)))
++
+ (define default-prefix (foreign-value "C_INSTALL_PREFIX" c-string))
+-(define default-bindir (foreign-value "C_INSTALL_BIN_HOME" c-string))
++(define default-bindir
++  (relocatable-path "libexec/chicken/bin"
++                    (foreign-value "C_INSTALL_BIN_HOME" c-string)))
+ 
+ (define default-csc 
+   (string-append default-bindir "/" (foreign-value "C_CSC_PROGRAM" c-string)))
+@@ -81,11 +89,21 @@ EOF
+ (define target-librarian-options (foreign-value "C_TARGET_LIBRARIAN_FLAGS" c-string))
+ 
+ (define host-prefix (foreign-value "C_INSTALL_PREFIX" c-string))
+-(define host-repo (foreign-value "C_INSTALL_EGG_HOME" c-string))
+-(define host-libdir (foreign-value "C_INSTALL_LIB_HOME" c-string))
+-(define host-bindir (foreign-value "C_INSTALL_BIN_HOME" c-string))
+-(define host-incdir (foreign-value "C_INSTALL_INCLUDE_HOME" c-string))
+-(define host-sharedir (foreign-value "C_INSTALL_SHARE_HOME" c-string))
++(define host-repo
++  (relocatable-path (string-append "lib/chicken/"
++                                   (number->string binary-version))
++                    (foreign-value "C_INSTALL_EGG_HOME" c-string)))
++(define host-libdir
++  (relocatable-path "lib" (foreign-value "C_INSTALL_LIB_HOME" c-string)))
++(define host-bindir
++  (relocatable-path "libexec/chicken/bin"
++                    (foreign-value "C_INSTALL_BIN_HOME" c-string)))
++(define host-incdir
++  (relocatable-path "include/chicken"
++                    (foreign-value "C_INSTALL_INCLUDE_HOME" c-string)))
++(define host-sharedir
++  (relocatable-path "share/chicken"
++                    (foreign-value "C_INSTALL_SHARE_HOME" c-string)))
+ (define host-libs (foreign-value "C_INSTALL_MORE_LIBS" c-string))
+ (define host-cflags (foreign-value "C_INSTALL_CFLAGS" c-string))
+ (define host-ldflags (foreign-value "C_INSTALL_LDFLAGS" c-string))
